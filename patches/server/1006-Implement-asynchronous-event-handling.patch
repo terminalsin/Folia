@@ -1,0 +1,1706 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shanyu Juneja <shanyujuneja@gmail.com>
+Date: Mon, 10 Jul 2023 20:52:42 +0200
+Subject: [PATCH] Implement asynchronous event handling
+
+Many things to express. This change implements the EntityTeleportEvent in a context thread safe way. The following are handled:
+- Passengers have the event called properly
+- Recursion is prevented by checking for the teleport status. Such status is revoked by overriding and chaining the teleport callback. It is manually removed when the event fails and henceforth the callback would call null, or when the entities are in the same chunk region, and hence don't call the callback.
+- Teleporting status is removed on callback
+- Modifying the teleport location of passenger entities is forbidden to prevent conflicts
+- Cancelling an entity riding will dismount it and NOT trigger any events for its passengers
+
+diff --git a/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java b/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java
+index 7ce9ebba8ce304d1f3f21d4f15ee5f3560d7700b..95deeb2cf94a3faade04ed36d93be37baa935469 100644
+--- a/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java
++++ b/src/main/java/io/papermc/paper/plugin/manager/PaperEventManager.java
+@@ -4,26 +4,35 @@ import co.aikar.timings.TimedEventExecutor;
+ import com.destroystokyo.paper.event.server.ServerExceptionEvent;
+ import com.destroystokyo.paper.exception.ServerEventException;
+ import com.google.common.collect.Sets;
++import io.papermc.paper.threadedregions.RegionizedServer;
++import io.papermc.paper.threadedregions.ThreadedRegionizer;
++import io.papermc.paper.threadedregions.TickRegionScheduler;
++import io.papermc.paper.threadedregions.TickRegions;
++import io.papermc.paper.util.CoordinateUtils;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.ChunkPos;
++import org.bukkit.Location;
+ import org.bukkit.Server;
+ import org.bukkit.Warning;
++import org.bukkit.craftbukkit.CraftWorld;
+ import org.bukkit.event.Event;
+ import org.bukkit.event.EventHandler;
+ import org.bukkit.event.EventPriority;
+ import org.bukkit.event.HandlerList;
+ import org.bukkit.event.Listener;
++import org.bukkit.event.player.PlayerTeleportEvent;
+ import org.bukkit.plugin.AuthorNagException;
+ import org.bukkit.plugin.EventExecutor;
+ import org.bukkit.plugin.IllegalPluginAccessException;
+ import org.bukkit.plugin.Plugin;
+ import org.bukkit.plugin.RegisteredListener;
+ import org.jetbrains.annotations.NotNull;
++import org.jetbrains.annotations.Nullable;
+ 
+ import java.lang.reflect.Method;
+-import java.util.Arrays;
+-import java.util.HashMap;
+-import java.util.HashSet;
+-import java.util.Map;
+-import java.util.Set;
++import java.util.*;
++import java.util.concurrent.CompletableFuture;
++import java.util.function.Function;
+ import java.util.logging.Level;
+ 
+ class PaperEventManager {
+@@ -34,8 +43,12 @@ class PaperEventManager {
+         this.server = server;
+     }
+ 
+-    // SimplePluginManager
+     public void callEvent(@NotNull Event event) {
++        callEventAsync(event, null);
++    }
++
++    // SimplePluginManager
++    public CompletableFuture<Event> callEventAsync(@NotNull Event event, @Nullable Location origin) {
+         if (event.isAsynchronous() && this.server.isPrimaryThread()) {
+             throw new IllegalStateException(event.getEventName() + " may only be triggered asynchronously.");
+         } else if (!event.isAsynchronous() && !this.server.isPrimaryThread() && !this.server.isStopping()) {
+@@ -45,32 +58,84 @@ class PaperEventManager {
+         HandlerList handlers = event.getHandlers();
+         RegisteredListener[] listeners = handlers.getRegisteredListeners();
+ 
+-        for (RegisteredListener registration : listeners) {
+-            if (!registration.getPlugin().isEnabled()) {
+-                continue;
++        final Thread currThread = Thread.currentThread();
++
++        if (currThread instanceof TickRegionScheduler.TickThreadRunner) {
++            final Stack<RegisteredListener> listenerStack = new Stack<>();
++            for (int i = listeners.length - 1; i >= 0; i--) {
++                listenerStack.push(listeners[i]);
++            }
++
++            ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> currentRegion = null;
++            if (origin == null && (currentRegion = TickRegionScheduler.getCurrentRegion()) == null) {
++                return dequeueEvent(listenerStack, event);
+             }
+ 
+-            try {
+-                registration.callEvent(event);
+-            } catch (AuthorNagException ex) {
+-                Plugin plugin = registration.getPlugin();
++            final ChunkPos chunkPos = origin == null
++                ? CoordinateUtils.getChunkPos(currentRegion.getOwnedSectionsUnsynchronised().nextLong())
++                : new ChunkPos(origin.getBlockX() >> 4, origin.getBlockZ() >> 4);
+ 
+-                if (plugin.isNaggable()) {
+-                    plugin.setNaggable(false);
++            final ServerLevel level = origin == null
++                ? TickRegionScheduler.getCurrentRegionizedWorldData().world
++                : ((CraftWorld) origin.getWorld()).getHandle();
+ 
+-                    this.server.getLogger().log(Level.SEVERE, String.format(
+-                        "Nag author(s): '%s' of '%s' about the following: %s",
+-                        plugin.getPluginMeta().getAuthors(),
+-                        plugin.getPluginMeta().getDisplayName(),
+-                        ex.getMessage()
+-                    ));
+-                }
+-            } catch (Throwable ex) {
+-                String msg = "Could not pass event " + event.getEventName() + " to " + registration.getPlugin().getPluginMeta().getDisplayName();
+-                this.server.getLogger().log(Level.SEVERE, msg, ex);
+-                if (!(event instanceof ServerExceptionEvent)) { // We don't want to cause an endless event loop
+-                    this.callEvent(new ServerExceptionEvent(new ServerEventException(msg, ex, registration.getPlugin(), registration.getListener(), event)));
+-                }
++            return dequeueEvent(listenerStack, event).thenCompose(e -> {
++                final CompletableFuture<Event> future = new CompletableFuture<>();
++                RegionizedServer.getInstance().taskQueue.queueTickTaskQueue(
++                    level,
++                    chunkPos.x,
++                    chunkPos.z,
++                    () -> future.complete(e)
++                );
++
++                return future;
++            });
++        } else {
++            for (RegisteredListener listener : listeners) {
++                callEvent(listener, event);
++            }
++
++            return CompletableFuture.completedFuture(event);
++        }
++    }
++
++    private CompletableFuture<Event> dequeueEvent(final Stack<RegisteredListener> stack, final Event event) {
++        if (stack.isEmpty())
++            return CompletableFuture.completedFuture(event);
++
++        final RegisteredListener registration = stack.pop();
++
++        if (!registration.getPlugin().isEnabled()) {
++            return dequeueEvent(stack, event);
++        }
++
++        return TickRegionScheduler.createEventTask(event, () -> callEvent(registration, event)).thenCompose(e -> dequeueEvent(stack, e));
++    }
++
++    private void callEvent(final RegisteredListener registration, final Event event) {
++        if (!registration.getPlugin().isEnabled())
++            return;
++
++        try {
++            registration.callEvent(event);
++        } catch (AuthorNagException ex) {
++            Plugin plugin = registration.getPlugin();
++
++            if (plugin.isNaggable()) {
++                plugin.setNaggable(false);
++
++                this.server.getLogger().log(Level.SEVERE, String.format(
++                    "Nag author(s): '%s' of '%s' about the following: %s",
++                    plugin.getPluginMeta().getAuthors(),
++                    plugin.getPluginMeta().getDisplayName(),
++                    ex.getMessage()
++                ));
++            }
++        } catch (Throwable ex) {
++            String msg = "Could not pass event " + event.getEventName() + " to " + registration.getPlugin().getPluginMeta().getDisplayName();
++            this.server.getLogger().log(Level.SEVERE, msg, ex);
++            if (!(event instanceof ServerExceptionEvent)) { // We don't want to cause an endless event loop
++                this.callEvent(new ServerExceptionEvent(new ServerEventException(msg, ex, registration.getPlugin(), registration.getListener(), event)));
+             }
+         }
+     }
+diff --git a/src/main/java/io/papermc/paper/plugin/manager/PaperPluginManagerImpl.java b/src/main/java/io/papermc/paper/plugin/manager/PaperPluginManagerImpl.java
+index dab211c458311869c61779305580a1c7da830f71..cdf4c4d0f0816831af48c632752af7336b2d1e5c 100644
+--- a/src/main/java/io/papermc/paper/plugin/manager/PaperPluginManagerImpl.java
++++ b/src/main/java/io/papermc/paper/plugin/manager/PaperPluginManagerImpl.java
+@@ -5,6 +5,7 @@ import io.papermc.paper.plugin.PermissionManager;
+ import io.papermc.paper.plugin.configuration.PluginMeta;
+ import io.papermc.paper.plugin.provider.entrypoint.DependencyContext;
+ import org.bukkit.Bukkit;
++import org.bukkit.Location;
+ import org.bukkit.Server;
+ import org.bukkit.command.CommandMap;
+ import org.bukkit.craftbukkit.CraftServer;
+@@ -27,6 +28,7 @@ import org.jetbrains.annotations.Nullable;
+ import java.io.File;
+ import java.util.List;
+ import java.util.Set;
++import java.util.concurrent.CompletableFuture;
+ 
+ public class PaperPluginManagerImpl implements PluginManager, DependencyContext {
+ 
+@@ -121,11 +123,17 @@ public class PaperPluginManagerImpl implements PluginManager, DependencyContext
+ 
+     // Event manipulation
+ 
++    @Deprecated
+     @Override
+     public void callEvent(@NotNull Event event) throws IllegalStateException {
+         this.paperEventManager.callEvent(event);
+     }
+ 
++    @Override
++    public CompletableFuture<Event> callEventAsync(@NotNull Event event, @Nullable Location origin) throws IllegalStateException {
++        return this.paperEventManager.callEventAsync(event, origin);
++    }
++
+     @Override
+     public void registerEvents(@NotNull Listener listener, @NotNull Plugin plugin) {
+         this.paperEventManager.registerEvents(listener, plugin);
+diff --git a/src/main/java/io/papermc/paper/threadedregions/EventTaskHandler.java b/src/main/java/io/papermc/paper/threadedregions/EventTaskHandler.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4259021b39b52f15d6bfc200e3c568e513960f8
+--- /dev/null
++++ b/src/main/java/io/papermc/paper/threadedregions/EventTaskHandler.java
+@@ -0,0 +1,98 @@
++package io.papermc.paper.threadedregions;
++
++import ca.spottedleaf.concurrentutil.collection.MultiThreadedQueue;
++
++import java.util.Stack;
++import java.util.concurrent.CompletableFuture;
++
++public class EventTaskHandler {
++    private final Stack<EventObserverList> eventTasks;
++
++    public EventTaskHandler() {
++        this.eventTasks = new Stack<>();
++    }
++
++    public CompletableFuture<Void> add(final EventObserverList list) {
++        final CompletableFuture<Void> completedHandler = new CompletableFuture<>();
++
++        final Runnable oldComplete = list.getRunnable();
++        list.setRunnable(() -> {
++            oldComplete.run();
++            completedHandler.complete(null);
++        });
++        this.eventTasks.push(list);
++
++        return completedHandler;
++    }
++
++    public EventObserverList pop() {
++        return this.eventTasks.pop();
++    }
++
++    public EventObserverList peek() {
++        if (isEmpty()) {
++            throw new IllegalStateException("No event tasks are currently running");
++        }
++
++        return this.eventTasks.peek();
++    }
++
++    public void peekAndAdd(final EventObserverList future) {
++        if (!isEmpty()) {
++            peek().add(add(future));
++        } else {
++            add(future);
++        }
++    }
++
++    public boolean isEmpty() {
++        return this.eventTasks.isEmpty();
++    }
++
++
++    public static class EventObserverList {
++        private MultiThreadedQueue<CompletableFuture<?>> queue = new MultiThreadedQueue<>();
++
++        private Runnable onComplete;
++        private boolean isLocked = true;
++
++        public EventObserverList(Runnable onComplete) {
++            this.onComplete = onComplete;
++        }
++
++        public void add(CompletableFuture<?> future) {
++            queue.add(future);
++        }
++
++        public boolean remove(Object o) {
++            final boolean output = queue.remove(o);
++            this.checkIfEmptyAndUnlocked();
++            return output;
++        }
++
++        public void clear() {
++            queue.clear();
++            this.checkIfEmptyAndUnlocked();
++        }
++
++        public void checkIfEmptyAndUnlocked() {
++            if (!isLocked && queue.isEmpty() && this.onComplete != null) {
++                this.onComplete.run();
++            }
++        }
++
++        public void close() {
++            this.isLocked = false;
++            this.checkIfEmptyAndUnlocked();
++        }
++
++        public Runnable getRunnable() {
++            return onComplete;
++        }
++
++        public void setRunnable(Runnable onComplete) {
++            this.onComplete = onComplete;
++        }
++    }
++
++}
+diff --git a/src/main/java/io/papermc/paper/threadedregions/ThreadedRegionizer.java b/src/main/java/io/papermc/paper/threadedregions/ThreadedRegionizer.java
+index 72a2b81a0a4dc6aab02d0dbad713ea882887d85f..a556035631f1bc573985168892cb33fd4ad09118 100644
+--- a/src/main/java/io/papermc/paper/threadedregions/ThreadedRegionizer.java
++++ b/src/main/java/io/papermc/paper/threadedregions/ThreadedRegionizer.java
+@@ -73,6 +73,10 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+         //this.loadTestData();
+     }
+ 
++    public ServerLevel getWorld() {
++        return world;
++    }
++
+     /*
+     private static String substr(String val, String prefix, int from) {
+         int idx = val.indexOf(prefix, from) + prefix.length();
+diff --git a/src/main/java/io/papermc/paper/threadedregions/TickRegionScheduler.java b/src/main/java/io/papermc/paper/threadedregions/TickRegionScheduler.java
+index ee9f5e1f3387998cddbeb1dc6dc6e2b1ea7cd670..7471acb1f49c0be9d1043885c34ecbf818df33df 100644
+--- a/src/main/java/io/papermc/paper/threadedregions/TickRegionScheduler.java
++++ b/src/main/java/io/papermc/paper/threadedregions/TickRegionScheduler.java
+@@ -7,14 +7,17 @@ import io.papermc.paper.util.TickThread;
+ import net.minecraft.server.MinecraftServer;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.world.level.ChunkPos;
++import org.bukkit.event.Event;
+ import org.slf4j.Logger;
+ import java.lang.management.ManagementFactory;
+ import java.lang.management.ThreadMXBean;
++import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.ThreadFactory;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.function.BooleanSupplier;
++import java.util.function.Consumer;
+ 
+ public final class TickRegionScheduler {
+ 
+@@ -85,6 +88,62 @@ public final class TickRegionScheduler {
+         tickThreadRunner.currentTickingTask = task;
+     }
+ 
++    /**
++     * Some context behind this strange method. When an event is called via a
++     * task handler, this event is registered to the current thread's event handler.
++     * <p>
++     * All chunk get tasked to the current thread's event handler between the start of
++     * the execution of the event and the end of the execution of the event are locked
++     * into an array. Once all of these have been completed, the completable future is
++     * handled, allowing for the mechanic to be completed.
++     * <p>
++     * This effectively allows for us to asynchronously wait for all the chunk tasks
++     * in different threads without endangering basic mechanics.
++     *
++     * @param event The event being called
++     * @param runnable The runnable to be executed before the next listener may proceed
++     * @return The completable future to be completed
++     */
++    public static CompletableFuture<Event> createEventTask(final Event event, final Runnable runnable) {
++        final Thread currThread = Thread.currentThread();
++        if (!(currThread instanceof TickThreadRunner tickThreadRunner)) {
++            throw new IllegalStateException("Must be tick thread runner");
++        }
++
++        final CompletableFuture<Event> nextTask = new CompletableFuture<>();
++        tickThreadRunner.eventHandler.peekAndAdd(
++            new EventTaskHandler.EventObserverList(() -> nextTask.complete(event))
++        );
++        // Run and fetch all the async data
++        runnable.run();
++
++        // Close the runner and let it complete, then be garbage disposed
++        tickThreadRunner.eventHandler.pop().close();
++
++        // Return the completable future
++        return nextTask;
++    }
++
++    public static <T> CompletableFuture<T> addEventListen(final CompletableFuture<T> task) {
++        final Thread currThread = Thread.currentThread();
++        if (!(currThread instanceof TickThreadRunner tickThreadRunner)) {
++            return task;
++        }
++
++        if (tickThreadRunner.eventHandler.isEmpty())
++            return task;
++
++        final EventTaskHandler.EventObserverList observer = tickThreadRunner.eventHandler.peek();
++        observer.add(task);
++
++        return task.whenComplete((ignored, throwable) -> {
++            if (throwable != null) {
++                LOGGER.error("Exception in event task", throwable);
++            }
++            observer.remove(task);
++        });
++    }
++
+     /**
+      * Returns the current ticking region, or {@code null} if there is no ticking region.
+      * If this thread is not a TickThread, then returns {@code null}.
+@@ -194,14 +253,17 @@ public final class TickRegionScheduler {
+ 
+     // By using our own thread object, we can use a field for the current region rather than a ThreadLocal.
+     // This is much faster than a thread local, since the thread local has to use a map lookup.
+-    private static final class TickThreadRunner extends TickThread {
++    public static final class TickThreadRunner extends TickThread {
+ 
+         private ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> currentTickingRegion;
+         private RegionizedWorldData currentTickingWorldRegionizedData;
+         private SchedulerThreadPool.SchedulableTick currentTickingTask;
++        private final EventTaskHandler eventHandler;
+ 
+         public TickThreadRunner(final Runnable run, final String name) {
+             super(run, name);
++
++            this.eventHandler = new EventTaskHandler();
+         }
+     }
+ 
+diff --git a/src/main/java/io/papermc/paper/util/CoordinateUtils.java b/src/main/java/io/papermc/paper/util/CoordinateUtils.java
+index 3a7dbcb9964723b8ed5e6b0a1ee4267923c746e4..4d87abee1f3680fe6c6baa40b1089b681f261aa1 100644
+--- a/src/main/java/io/papermc/paper/util/CoordinateUtils.java
++++ b/src/main/java/io/papermc/paper/util/CoordinateUtils.java
+@@ -45,6 +45,13 @@ public final class CoordinateUtils {
+         return (int)(chunkKey >>> 32);
+     }
+ 
++    public static ChunkPos getChunkPos(final long chunkKey) {
++        return new ChunkPos(
++            getChunkX(chunkKey),
++            getChunkZ(chunkKey)
++        );
++    }
++
+     public static int getChunkCoordinate(final double blockCoordinate) {
+         return Mth.floor(blockCoordinate) >> 4;
+     }
+diff --git a/src/main/java/net/minecraft/server/commands/TeleportCommand.java b/src/main/java/net/minecraft/server/commands/TeleportCommand.java
+index 15c4fa89e1f1dbc80055f6f92904d1cc05a24dba..bb4bdd1feaf0ca8351e51312c8ddeb521e3bed0a 100644
+--- a/src/main/java/net/minecraft/server/commands/TeleportCommand.java
++++ b/src/main/java/net/minecraft/server/commands/TeleportCommand.java
+@@ -35,6 +35,7 @@ import net.minecraft.world.phys.Vec3;
+ // CraftBukkit start
+ import org.bukkit.Location;
+ import org.bukkit.craftbukkit.CraftWorld;
++import org.bukkit.craftbukkit.util.CraftVector;
+ import org.bukkit.event.entity.EntityTeleportEvent;
+ import org.bukkit.event.player.PlayerTeleportEvent;
+ // CraftBukkit end
+@@ -167,13 +168,12 @@ public class TeleportCommand {
+                 Vec3 posFinal = new Vec3(x, y, z);
+                 Float yawFinal = Float.valueOf(f2);
+                 Float pitchFinal = Float.valueOf(f3);
++
+                 target.getBukkitEntity().taskScheduler.schedule((nmsEntity) -> {
+                     nmsEntity.unRide();
+-                    nmsEntity.teleportAsync(
+-                        worldFinal, posFinal, yawFinal, pitchFinal, Vec3.ZERO,
+-                        org.bukkit.event.player.PlayerTeleportEvent.TeleportCause.COMMAND,
+-                        Entity.TELEPORT_FLAG_LOAD_CHUNK,
+-                        null
++                    target.getBukkitEntity().teleportAsync(
++                        new Location(worldFinal.getWorld(), posFinal.x, posFinal.y, posFinal.z, yawFinal, pitchFinal),
++                        org.bukkit.event.player.PlayerTeleportEvent.TeleportCause.COMMAND
+                     );
+                 }, null, 1L);
+                 return;
+diff --git a/src/main/java/net/minecraft/server/level/ServerPlayer.java b/src/main/java/net/minecraft/server/level/ServerPlayer.java
+index 817f79bfca1aec161cb4635b9c7a8e21b14db7eb..47f5767f5720c63862475aba25fd4f5690b93f5d 100644
+--- a/src/main/java/net/minecraft/server/level/ServerPlayer.java
++++ b/src/main/java/net/minecraft/server/level/ServerPlayer.java
+@@ -17,6 +17,7 @@ import java.util.Objects;
+ import java.util.Optional;
+ import java.util.OptionalInt;
+ import java.util.Set;
++import java.util.concurrent.CompletableFuture;
+ import javax.annotation.Nullable;
+ import net.minecraft.BlockUtil;
+ import net.minecraft.ChatFormatting;
+@@ -1676,6 +1677,25 @@ public class ServerPlayer extends Player {
+     }
+     // CraftBukkit end
+ 
++    // Folia start
++    @Override
++    protected CompletableFuture<CraftPortalEvent> callPortalEventAsync(Entity entity,
++                                                                       ServerLevel enterWorldServer, PositionImpl originPosition,
++                                                                       ServerLevel exitWorldServer, PositionImpl exitPosition,
++                                                                       TeleportCause cause, int searchRadius, int creationRadius) {
++        Location enter = CraftLocation.toBukkit(originPosition, enterWorldServer.getWorld());
++        Location exit = CraftLocation.toBukkit(exitPosition, exitWorldServer.getWorld(), getYRot(), getXRot());
++        PlayerPortalEvent event = new PlayerPortalEvent(this.getBukkitEntity(), enter, exit, cause, searchRadius, true, creationRadius);
++        return event.callEventAsync(enter)
++            .thenApply((ignored) -> {
++                if (event.isCancelled() || event.getTo() == null || event.getTo().getWorld() == null) {
++                    return null;
++                }
++                return new CraftPortalEvent(event);
++            });
++    }
++    // Folia end
++
+     private void createEndPlatform(ServerLevel world, BlockPos centerPos) {
+         BlockPos.MutableBlockPos blockposition_mutableblockposition = centerPos.mutable();
+         org.bukkit.craftbukkit.util.BlockStateListPopulator blockList = new org.bukkit.craftbukkit.util.BlockStateListPopulator(world); // CraftBukkit
+diff --git a/src/main/java/net/minecraft/server/network/ServerLoginPacketListenerImpl.java b/src/main/java/net/minecraft/server/network/ServerLoginPacketListenerImpl.java
+index 75b1877f8c3e4da3183437f327ef3376fd0a3c21..d318230f7f322ca3fd681e44307b9a27a2424192 100644
+--- a/src/main/java/net/minecraft/server/network/ServerLoginPacketListenerImpl.java
++++ b/src/main/java/net/minecraft/server/network/ServerLoginPacketListenerImpl.java
+@@ -1,5 +1,6 @@
+ package net.minecraft.server.network;
+ 
++import com.destroystokyo.paper.event.player.PlayerInitialSpawnEvent;
+ import com.google.common.primitives.Ints;
+ import com.mojang.authlib.GameProfile;
+ import com.mojang.authlib.exceptions.AuthenticationUnavailableException;
+@@ -36,6 +37,7 @@ import net.minecraft.util.Crypt;
+ import net.minecraft.util.CryptException;
+ import net.minecraft.util.RandomSource;
+ import org.apache.commons.lang3.Validate;
++import org.bukkit.Location;
+ import org.slf4j.Logger;
+ 
+ // CraftBukkit start
+@@ -176,41 +178,56 @@ public class ServerLoginPacketListenerImpl implements ServerLoginPacketListener,
+                 // the loadSpawnForNewPlayer function always completes the completable once the chunks were loaded,
+                 // on the load callback for those chunks (so on the same region)
+                 // this guarantees the chunk cannot unload under our feet
+-                toComplete.addWaiter((org.bukkit.Location loc, Throwable t) -> {
+-                    int chunkX = net.minecraft.util.Mth.floor(loc.getX()) >> 4;
+-                    int chunkZ = net.minecraft.util.Mth.floor(loc.getZ()) >> 4;
+-
+-                    net.minecraft.server.level.ServerLevel world = ((org.bukkit.craftbukkit.CraftWorld)loc.getWorld()).getHandle();
+-                    // we just need to hold the chunks at loaded until the next tick
+-                    // so we do not need to care about unique IDs for the ticket
+-                    world.getChunkSource().addTicketAtLevel(
+-                        net.minecraft.server.level.TicketType.LOGIN,
+-                        new net.minecraft.world.level.ChunkPos(chunkX, chunkZ),
+-                        io.papermc.paper.chunk.system.scheduling.ChunkHolderManager.FULL_LOADED_TICKET_LEVEL,
+-                        net.minecraft.util.Unit.INSTANCE
+-                    );
+-
+-                    io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueTickTaskQueue(
+-                        world, chunkX, chunkZ,
+-                        () -> {
+-                            // now at this point the connection is held by the region, so we have to check isConnected()
+-                            // this would have been handled in connection ticking, but we are in a state between
+-                            // being owned by the global tick thread and the region so we have to do it
+-                            if (t != null || !ServerLoginPacketListenerImpl.this.connection.isConnected()) {
+-                                ServerLoginPacketListenerImpl.this.connection.handleDisconnection();
+-                                return;
+-                            }
+-                            ServerLoginPacketListenerImpl.this.state = State.ACCEPTED;
+-                            ServerLoginPacketListenerImpl.this.server.getPlayerList().placeNewPlayer(
+-                                ServerLoginPacketListenerImpl.this.connection,
+-                                s,
+-                                data.getValue(),
+-                                lastKnownName.getValue(),
+-                                loc
++                toComplete.addWaiter((org.bukkit.Location initialLocation, Throwable t) -> {
++
++                    // Pretty easy patch to support the PlayerSpawnLocationEvent
++                    // The logic behind this is to handle the location before the chunk
++                    // or the waiter handles any of the chunk loacation logic.
++                    // This admittedly is a bit hacky, but it works.
++                        final PlayerInitialSpawnEvent ev = new com.destroystokyo.paper.event.player.PlayerInitialSpawnEvent(
++                            s.getBukkitEntity(),
++                            initialLocation
++                        );
++
++                        ev.callEventAsync(initialLocation).thenAccept(event -> {
++                            final Location loc = ev.getSpawnLocation();
++
++                            int chunkX = net.minecraft.util.Mth.floor(loc.getX()) >> 4;
++                            int chunkZ = net.minecraft.util.Mth.floor(loc.getZ()) >> 4;
++
++                            net.minecraft.server.level.ServerLevel world = ((org.bukkit.craftbukkit.CraftWorld)loc.getWorld()).getHandle();
++                            // we just need to hold the chunks at loaded until the next tick
++                            // so we do not need to care about unique IDs for the ticket
++                            world.getChunkSource().addTicketAtLevel(
++                                net.minecraft.server.level.TicketType.LOGIN,
++                                new net.minecraft.world.level.ChunkPos(chunkX, chunkZ),
++                                io.papermc.paper.chunk.system.scheduling.ChunkHolderManager.FULL_LOADED_TICKET_LEVEL,
++                                net.minecraft.util.Unit.INSTANCE
+                             );
+-                        },
+-                        ca.spottedleaf.concurrentutil.executor.standard.PrioritisedExecutor.Priority.HIGHER
+-                    );
++
++                            io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueTickTaskQueue(
++                                world, chunkX, chunkZ,
++                                () -> {
++                                    // now at this point the connection is held by the region, so we have to check isConnected()
++                                    // this would have been handled in connection ticking, but we are in a state between
++                                    // being owned by the global tick thread and the region so we have to do it
++                                    if (t != null || !ServerLoginPacketListenerImpl.this.connection.isConnected()) {
++                                        ServerLoginPacketListenerImpl.this.connection.handleDisconnection();
++                                        return;
++                                    }
++                                    ServerLoginPacketListenerImpl.this.state = State.ACCEPTED;
++                                    ServerLoginPacketListenerImpl.this.server.getPlayerList().placeNewPlayer(
++                                        ServerLoginPacketListenerImpl.this.connection,
++                                        s,
++                                        data.getValue(),
++                                        lastKnownName.getValue(),
++                                        loc
++                                    );
++                                },
++                                ca.spottedleaf.concurrentutil.executor.standard.PrioritisedExecutor.Priority.HIGHER
++                            );
++                        });
++
+                 });
+                 this.server.getPlayerList().loadSpawnForNewPlayer(this.connection, s, data, lastKnownName, toComplete);
+                 // Folia end - region threading - rewrite login process
+diff --git a/src/main/java/net/minecraft/server/players/PlayerList.java b/src/main/java/net/minecraft/server/players/PlayerList.java
+index ffb5332310e9b2d10292fe01c37fd48552fedffc..fb8820d0b3542314822f92e3c6c6e63bf6e61cc4 100644
+--- a/src/main/java/net/minecraft/server/players/PlayerList.java
++++ b/src/main/java/net/minecraft/server/players/PlayerList.java
+@@ -339,10 +339,10 @@ public abstract class PlayerList {
+ 
+         // Spigot start - spawn location event
+         Player spawnPlayer = player.getBukkitEntity();
+-        org.spigotmc.event.player.PlayerSpawnLocationEvent ev = new com.destroystokyo.paper.event.player.PlayerInitialSpawnEvent(spawnPlayer, spawnPlayer.getLocation()); // Paper use our duplicate event
++        //org.spigotmc.event.player.PlayerSpawnLocationEvent ev = new com.destroystokyo.paper.event.player.PlayerInitialSpawnEvent(spawnPlayer, spawnPlayer.getLocation()); // Paper use our duplicate event
+         //this.cserver.getPluginManager().callEvent(ev); // Folia - region threading - TODO WTF TO DO WITH THIS EVENT?
+ 
+-        Location loc = ev.getSpawnLocation();
++        Location loc = selectedSpawn;
+         worldserver1 = ((CraftWorld) loc.getWorld()).getHandle();
+ 
+         player.spawnIn(worldserver1);
+diff --git a/src/main/java/net/minecraft/world/entity/Entity.java b/src/main/java/net/minecraft/world/entity/Entity.java
+index ee15661227754149164893d6acf678d13b2e1b27..d952fc150d1cf4358f3f1b2867514dfb1540ce42 100644
+--- a/src/main/java/net/minecraft/world/entity/Entity.java
++++ b/src/main/java/net/minecraft/world/entity/Entity.java
+@@ -1,5 +1,6 @@
+ package net.minecraft.world.entity;
+ 
++import ca.spottedleaf.concurrentutil.scheduler.SchedulerThreadPool;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableList.Builder;
+ import com.google.common.collect.Iterables;
+@@ -7,20 +8,17 @@ import com.google.common.collect.Lists;
+ import com.google.common.collect.Sets;
+ import com.google.common.collect.UnmodifiableIterator;
+ import com.mojang.logging.LogUtils;
++import io.papermc.paper.event.entity.EntityPortalReadyEvent;
++import io.papermc.paper.threadedregions.TickRegionScheduler;
+ import it.unimi.dsi.fastutil.objects.Object2DoubleArrayMap;
+ import it.unimi.dsi.fastutil.objects.Object2DoubleMap;
+-import java.util.Arrays;
+-import java.util.Collections;
+-import java.util.HashSet;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.Locale;
+-import java.util.Objects;
+-import java.util.Optional;
+-import java.util.Set;
+-import java.util.UUID;
++
++import java.util.*;
++import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicReference;
+ import java.util.function.BiConsumer;
++import java.util.function.Consumer;
+ import java.util.function.Predicate;
+ import java.util.stream.Stream;
+ import javax.annotation.Nullable;
+@@ -125,17 +123,18 @@ import net.minecraft.world.phys.shapes.Shapes;
+ import net.minecraft.world.phys.shapes.VoxelShape;
+ import net.minecraft.world.scores.PlayerTeam;
+ import net.minecraft.world.scores.Team;
++import org.bukkit.*;
++import org.bukkit.craftbukkit.CraftServer;
++import org.bukkit.event.Cancellable;
++import org.bukkit.event.Event;
++import org.bukkit.event.entity.*;
+ import org.slf4j.Logger;
+-import org.bukkit.Bukkit;
+-import org.bukkit.Location;
+-import org.bukkit.Server;
+ import org.bukkit.block.BlockFace;
+ import org.bukkit.command.CommandSender;
+ import org.bukkit.craftbukkit.event.CraftPortalEvent;
+ import org.bukkit.entity.Hanging;
+ import org.bukkit.entity.LivingEntity;
+ import org.bukkit.entity.Vehicle;
+-import org.bukkit.event.entity.EntityCombustByEntityEvent;
+ import org.bukkit.event.hanging.HangingBreakByEntityEvent;
+ import org.bukkit.event.vehicle.VehicleBlockCollisionEvent;
+ import org.bukkit.event.vehicle.VehicleEnterEvent;
+@@ -146,11 +145,6 @@ import org.bukkit.craftbukkit.entity.CraftPlayer;
+ import org.bukkit.craftbukkit.event.CraftEventFactory;
+ import org.bukkit.craftbukkit.util.CraftLocation;
+ import org.bukkit.entity.Pose;
+-import org.bukkit.event.entity.EntityAirChangeEvent;
+-import org.bukkit.event.entity.EntityCombustEvent;
+-import org.bukkit.event.entity.EntityDropItemEvent;
+-import org.bukkit.event.entity.EntityPortalEvent;
+-import org.bukkit.event.entity.EntityPoseChangeEvent;
+ import org.bukkit.event.player.PlayerTeleportEvent;
+ import org.bukkit.plugin.PluginManager;
+ // CraftBukkit end
+@@ -529,8 +523,13 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+         ResourceKey<Level> resourcekey = world.getTypeKey() == LevelStem.END ? Level.OVERWORLD : Level.END; // CraftBukkit - SPIGOT-6152: send back to main overworld in custom ends
+         ServerLevel worldserver = world.getServer().getLevel(resourcekey);
+ 
+-        org.bukkit.event.entity.EntityPortalEnterEvent event = new org.bukkit.event.entity.EntityPortalEnterEvent(this.getBukkitEntity(), new org.bukkit.Location(world.getWorld(), pos.getX(), pos.getY(), pos.getZ()));
++        // Handle events
++        final EntityPortalEnterEvent event = new EntityPortalEnterEvent(
++            this.getBukkitEntity(),
++            new Location(world.getWorld(), pos.getX(), pos.getY(), pos.getZ())
++        );
+         event.callEvent();
++        // End events
+ 
+         if (this instanceof ServerPlayer) {
+             ((ServerPlayer)this).changeDimension(worldserver, PlayerTeleportEvent.TeleportCause.END_PORTAL);
+@@ -549,6 +548,16 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+     public final long referenceId = REFERENCE_ID_GENERATOR.getAndIncrement();
+     // Folia end
+     // Folia start - region ticking
++    private boolean teleporting;
++
++    public boolean isTeleporting() {
++        return teleporting;
++    }
++
++    public void setTeleporting(boolean teleporting) {
++        this.teleporting = teleporting;
++    }
++
+     public void updateTicks(long fromTickOffset, long fromRedstoneTimeOffset) {
+         if (this.activatedTick != Integer.MIN_VALUE) {
+             this.activatedTick += fromTickOffset;
+@@ -3022,6 +3031,12 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+                 this.portalEntrancePos = pos.immutable();
+             }
+ 
++            // Folia start - event handling
++            if (portalTime <= 0 && !isInsidePortal) {
++                final Location location = new org.bukkit.Location(this.level.getWorld(), pos.getX(), pos.getY(), pos.getZ());
++                new EntityPortalEnterEvent(this.getBukkitEntity(), location).callEventAsync(location);
++            }
++
+             this.isInsidePortal = true;
+         }
+     }
+@@ -3824,19 +3839,22 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+         return copy;
+     }
+ 
+-    public final boolean teleportAsync(ServerLevel destination, Vec3 pos, Float yaw, Float pitch, Vec3 speedDirectionUpdate,
++    public final boolean teleportAsync(ServerLevel destination, Vec3 ogPos, Float ogYaw, Float ogPitch, Vec3 speedDirectionUpdate,
+                                        org.bukkit.event.player.PlayerTeleportEvent.TeleportCause cause, long teleportFlags,
+                                        java.util.function.Consumer<Entity> teleportComplete) {
+         io.papermc.paper.util.TickThread.ensureTickThread(this, "Cannot teleport entity async");
+ 
+-        if (!ServerLevel.isInSpawnableBounds(new BlockPos(io.papermc.paper.util.CoordinateUtils.getBlockX(pos), io.papermc.paper.util.CoordinateUtils.getBlockY(pos), io.papermc.paper.util.CoordinateUtils.getBlockZ(pos)))) {
++        if (!ServerLevel.isInSpawnableBounds(new BlockPos(
++            io.papermc.paper.util.CoordinateUtils.getBlockX(ogPos),
++            io.papermc.paper.util.CoordinateUtils.getBlockY(ogPos),
++            io.papermc.paper.util.CoordinateUtils.getBlockZ(ogPos)))) {
+             return false;
+         }
+ 
+         if (!this.canTeleportAsync()) {
+             return false;
+         }
+-        this.getBukkitEntity(); // force bukkit entity to be created before TPing
++        org.bukkit.entity.Entity bukkitEntity = this.getBukkitEntity(); // force bukkit entity to be created before TPing
+         if ((teleportFlags & TELEPORT_FLAG_UNMOUNT) == 0L) {
+             for (Entity entity : this.getIndirectPassengers()) {
+                 if (!entity.canTeleportAsync()) {
+@@ -3858,60 +3876,258 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+             }
+         }
+ 
+-        // TODO any events that can modify go HERE
++        // If teleport is successful, set the teleporting status BEFORE calling the callback. This
++        // effectively prevents, as seen above, from recursive teleportation, but allows for chained
++        // teleportation.
++
++        // TODO:    This is a hack to allow for chained teleportation. There is an important need for
++        //          an api change to support culling, returning back what entity was attempted to be
++        //          teleported and what the status of such teleportation attempt was
++        //
++        //          eg:
++        //          TeleportOutput (
++        //              Entity entity,
++        //              ResultType resultType,
++        //
++        //              isSuccees() -> boolean [resultType == SUCCESS],
++        //              isFailed() -> boolean [resultType == CANCELLED || resultType == CANCELLED_VEHICLE || resultType == ERROR]
++        //          )
++        //
++        //          ResultType (SUCCESS, CANCELLED, CANCELLED_VEHICLE, ERROR)
++        //
++        final java.util.function.Consumer<Entity> previousConsumer = teleportComplete == null ? entity -> {} : teleportComplete;
++        teleportComplete = entity -> {
++            if (entity != null) {
++                final EntityTreeNode tree = entity.detachPassengers();
++                for (final EntityTreeNode entityNode : tree.getFullTree()) {
++                    entityNode.root.setTeleporting(false);
++                }
++            }
++
++            previousConsumer.accept(entity);
++        };
++
++        // Grab original location
++        final Location ogFrom = this.getBukkitEntity().getLocation();
++        final Location ogTo =  new Location(
++            destination.getWorld(),
++            ogPos == null ? this.getX() : ogPos.x,
++            ogPos == null ? this.getX() : ogPos.y,
++            ogPos == null ? this.getX() : ogPos.z,
++            ogYaw == null ? bukkitEntity.getLocation().getYaw() : ogYaw,
++            ogPitch == null ? bukkitEntity.getLocation().getPitch() : ogPitch
++        );
++
++        // Special event exclusively for players.
++        final Consumer<Entity> finalTeleportComplete = teleportComplete;
++        this.createBukkitTeleport(
++            ogFrom,
++            ogTo,
++            cause,
++            teleportComplete
++        ).callEventAsync(ogFrom).thenAccept(teleportEvent -> {
++            final Location to;
++            if (this instanceof Player) {
++                to = ((PlayerTeleportEvent) teleportEvent).getTo();
++            } else {
++                to = ((EntityTeleportEvent) teleportEvent).getTo();
++            }
++
++            if (to == null) {
++                return; // TODO: Make teleportAsync return an async result
++            }
++
++            // Prevent recursive action. Teleports should
++            if (this.isTeleporting()) {
++                throw new IllegalStateException(
++                    "Entity is already teleporting. Please do not teleport an entity inside a EntityTeleportEvent listener."
++                );
++            }
++            this.setTeleporting(true);
++
++            // Update the events accordingly.
++            Vec3 pos = new Vec3(
++                to.getX(),
++                to.getY(),
++                to.getZ()
++            );
++            float yaw = to.getYaw();
++            float pitch = to.getPitch();
++
++            // End of event handling
++            Runnable executor = () -> {
++                // check for same region
++                if (destination == this.level()) {
++                    Vec3 currPos = this.position();
++                    if (
++                        destination.regioniser.getRegionAtUnsynchronised(
++                            io.papermc.paper.util.CoordinateUtils.getChunkX(currPos), io.papermc.paper.util.CoordinateUtils.getChunkZ(currPos)
++                        ) == destination.regioniser.getRegionAtUnsynchronised(
++                            io.papermc.paper.util.CoordinateUtils.getChunkX(pos), io.papermc.paper.util.CoordinateUtils.getChunkZ(pos)
++                        )
++                    ) {
++                        EntityTreeNode passengerTree = this.detachPassengers();
++
++                        // Note: The client does not accept position updates for controlled entities. So, we must
++                        // perform a lot of tracker updates here to make it all work out.
++
++                        // first, clear the tracker
++                        passengerTree.clearTracker();
++                        for (EntityTreeNode entity : passengerTree.getFullTree()) {
++                            entity.root.teleportSyncSameRegion(pos, yaw, pitch, speedDirectionUpdate);
++                            entity.root.setTeleporting(false); // No callback, we must force this action
++                        }
++
++                        passengerTree.restore();
++                        // re-add to the tracker once the tree is restored
++                        passengerTree.addTracker();
++
++                        // adjust entities to final position
++                        passengerTree.adjustRiders(true);
++
++                        // the tracker clear/add logic is only used in the same region, as the other logic
++                        // performs add/remove from world logic which will also perform add/remove tracker logic
++
++                        if (finalTeleportComplete != null) {
++                            finalTeleportComplete.accept(this);
++                        }
++                    }
++                }
+ 
+-        // check for same region
+-        if (destination == this.level()) {
+-            Vec3 currPos = this.position();
+-            if (
+-                destination.regioniser.getRegionAtUnsynchronised(
+-                    io.papermc.paper.util.CoordinateUtils.getChunkX(currPos), io.papermc.paper.util.CoordinateUtils.getChunkZ(currPos)
+-                ) == destination.regioniser.getRegionAtUnsynchronised(
+-                    io.papermc.paper.util.CoordinateUtils.getChunkX(pos), io.papermc.paper.util.CoordinateUtils.getChunkZ(pos)
+-                )
+-            ) {
+                 EntityTreeNode passengerTree = this.detachPassengers();
+-                // Note: The client does not accept position updates for controlled entities. So, we must
+-                // perform a lot of tracker updates here to make it all work out.
+ 
+-                // first, clear the tracker
+-                passengerTree.clearTracker();
+-                for (EntityTreeNode entity : passengerTree.getFullTree()) {
+-                    entity.root.teleportSyncSameRegion(pos, yaw, pitch, speedDirectionUpdate);
++                List<EntityTreeNode> fullPassengerTree = passengerTree.getFullTree();
++                ServerLevel originWorld = (ServerLevel)this.level;
++
++                for (EntityTreeNode node : fullPassengerTree) {
++                    node.root.preChangeDimension();
+                 }
+ 
+-                passengerTree.restore();
+-                // re-add to the tracker once the tree is restored
+-                passengerTree.addTracker();
++                for (EntityTreeNode node : fullPassengerTree) {
++                    node.root = node.root.transformForAsyncTeleport(destination, pos, yaw, pitch, speedDirectionUpdate);
++                    node.root.setTeleporting(true); // hotfix
++                }
+ 
+-                // adjust entities to final position
+-                passengerTree.adjustRiders(true);
++                passengerTree.root.placeInAsync(originWorld, destination, teleportFlags, passengerTree, finalTeleportComplete);
++            };
+ 
+-                // the tracker clear/add logic is only used in the same region, as the other logic
+-                // performs add/remove from world logic which will also perform add/remove tracker logic
++            if (!this.getPassengers().isEmpty()) {
++                final EntityTreeNode passengerTree = this.detachPassengers();
+ 
+-                if (teleportComplete != null) {
+-                    teleportComplete.accept(this);
++                // Failsafe
++                if (passengerTree.passengers == null) {
++                    throw new IllegalStateException("Passenger tree root must not be null");
+                 }
+-                return true;
++
++                // First handle all events
++                // This is a DFS. Here's one issue one may think of. Let's assume we have three entities.
++                // We have Player 1, Player 2, and Player 3. Player 1 is riding Player 2, and
++                // Player 2 is riding Player 3. If we teleport Player 1, we must teleport Player 2
++                // But let's assume player 1 cancels the event, then he will be dismounted from player 2.
++                // But what if player 2 also cancels the event? Then player 2 will be dismounted from player 3
++                //
++                // This is why we must perform a BFS correctly and manually. This also improves redundant
++                // teleport calls for entities that won't be teleported anyway
++                final Stack<EntityTreeNode> entityStack = new Stack<>();
++                entityStack.addAll(Arrays.asList(passengerTree.passengers)); // Add all passengers
++
++                final Runnable lastExecutor = executor;
++                executor = () -> {
++                    this.handlePassengerTeleport(
++                        entityStack,
++                        ogFrom,
++                        to,
++                        cause,
++                        entity -> {}
++                    ).thenRun(lastExecutor);
++                };
+             }
+-        }
++            executor.run();
++        });
+ 
+-        EntityTreeNode passengerTree = this.detachPassengers();
+-        List<EntityTreeNode> fullPassengerTree = passengerTree.getFullTree();
+-        ServerLevel originWorld = (ServerLevel)this.level;
++        return true;
++    }
+ 
+-        for (EntityTreeNode node : fullPassengerTree) {
+-            node.root.preChangeDimension();
+-        }
++    private CompletableFuture<Void> handlePassengerTeleport(final Stack<EntityTreeNode> entityStack,
++                                                            final Location from,
++                                                            final Location to,
++                                                            final PlayerTeleportEvent.TeleportCause cause,
++                                                            final Consumer<Entity> teleportComplete) {
++        if (entityStack.isEmpty()) {
++            return CompletableFuture.completedFuture(null);
++        }
++
++        final EntityTreeNode entityNode = entityStack.pop();
++        final Entity entity = entityNode.root;
++        final org.bukkit.entity.Entity bukkitPassengerEntity = entity.getBukkitEntity();
++
++        // TODO:    Temporary whilst api changes are discussed and implemented
++        //          The property teleporting is removed due to entity nbt data
++        //          being saved and loaded.
++        entity.setTeleporting(true);
++
++        // Teleport action
++        // Must perform clone as location is mutable. Make sure to prevent the location from modified
++        final Location previous = to.clone();
++
++        return entity.createBukkitTeleport(
++            bukkitPassengerEntity.getLocation(),
++            to,
++            cause,
++            teleportComplete
++        ).callEventAsync(from).thenAccept(teleportEvent -> {
++            Location entityTo;
++            if (((Cancellable) teleportEvent).isCancelled()) {
++                entity.stopRiding(true); // Suppress cancel, we must force this action
++                entity.setTeleporting(false);
++                return;
++            } else {
++                if (this instanceof Player) {
++                    entityTo = ((PlayerTeleportEvent) teleportEvent).getTo();
++                } else {
++                    entityTo = ((EntityTeleportEvent) teleportEvent).getTo();
++                }
++            }
+ 
+-        for (EntityTreeNode node : fullPassengerTree) {
+-            node.root = node.root.transformForAsyncTeleport(destination, pos, yaw, pitch, speedDirectionUpdate);
+-        }
++            // Failsafe
++            if (entityTo == null) {
++                throw new IllegalStateException(
++                    "EntityTeleportEvent#getTo() returned null - This is illegal behaviour. Please instead cancel the event."
++                );
++            }
+ 
+-        passengerTree.root.placeInAsync(originWorld, destination, teleportFlags, passengerTree, teleportComplete);
++            // Prevent riding entities from changing the destination location
++            if (!previous.equals(to)) {
++                throw new UnsupportedOperationException("Teleporting entities whilst they are riding another entity is not supported");
++            }
+ 
+-        return true;
++            // Add all passengers
++            if (entityNode.passengers != null) {
++                entityStack.addAll(Arrays.asList(entityNode.passengers));
++            }
++        }).thenRun(() -> handlePassengerTeleport(entityStack, to, from, cause, teleportComplete));
++    }
++
++    protected @Nullable Event createBukkitTeleport(Location from, Location to, PlayerTeleportEvent.TeleportCause cause,
++                                                   Consumer<Entity> teleportComplete) {
++        org.bukkit.entity.Entity bukkitEntity = this.getBukkitEntity(); // force bukkit entity to be created before TPing
++
++        // --- Event handling
++        if (this instanceof Player) {
++            return new PlayerTeleportEvent(
++                (org.bukkit.entity.Player) bukkitEntity,
++                from,
++                to,
++                cause,
++                new HashSet<>() // Unsupported by API currently.
++            );
++        } else {
++            return new EntityTeleportEvent(
++                bukkitEntity,
++                from,
++                to
++            );
++        }
+     }
+ 
+     public void preChangeDimension() {
+@@ -3951,6 +4167,11 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+             return false;
+         }
+ 
++        org.bukkit.event.entity.EntityPortalEnterEvent event = new org.bukkit.event.entity.EntityPortalEnterEvent(
++            this.getBukkitEntity(), new org.bukkit.Location(world.getWorld(), pos.getX(), pos.getY(), pos.getZ())
++        );
++        event.callEventAsync();
++
+         return this.endPortalLogicAsync();
+     }
+ 
+@@ -3962,6 +4183,7 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+         if (this.isInsidePortal) {
+             // if we are in a nether portal still, this flag will be set next tick.
+             this.isInsidePortal = false;
++
+             if (this.portalTime++ >= portalWaitTime) {
+                 this.portalTime = portalWaitTime;
+                 if (this.netherPortalLogicAsync()) {
+@@ -3991,9 +4213,10 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+ 
+     public boolean netherPortalLogicAsync() {
+         io.papermc.paper.util.TickThread.ensureTickThread(this, "Cannot portal entity async");
+-
+         ServerLevel destination = this.getServer().getLevel(this.level().getTypeKey() == LevelStem.NETHER ? Level.OVERWORLD : Level.NETHER);
++
+         if (destination == null) {
++            this.portalTime = 0;
+             // wat
+             return false;
+         }
+@@ -4023,7 +4246,42 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+                         targetPos, 16, // load 16 blocks to be safe from block physics
+                         ca.spottedleaf.concurrentutil.executor.standard.PrioritisedExecutor.Priority.HIGH,
+                         (chunks) -> {
+-                            ServerLevel.makeObsidianPlatform(destination, null, targetPos);
++                            this.callPortalEventAsync(
++                                this,
++                                origin,
++                                new PositionImpl(
++                                    this.getX(), this.getY(), this.getZ()
++                                ),
++                                destination.getLevel(),
++                                new PositionImpl(
++                                    targetPos.getX(), targetPos.getY(), targetPos.getZ()
++                                ),
++                                PlayerTeleportEvent.TeleportCause.END_PORTAL,
++                                0,
++                                0
++                            ).thenApply(e -> e).thenAccept((event) -> {
++                                if (event.isCancelled()) {
++                                    portalInfoCompletable.complete(null);
++                                    return;
++                                }
++
++                                // the portal obsidian is placed at targetPos.y - 2, so if we want to place the entity
++                                // on the obsidian, we need to spawn at targetPos.y - 1
++                                if (event.getCanCreatePortal()) {
++                                    ServerLevel.makeObsidianPlatform(destination, null, targetPos);
++                                }
++
++                                portalInfoCompletable.complete(
++                                    new PortalInfo(
++                                        Vec3.atBottomCenterOf(targetPos.below()),
++                                        Vec3.ZERO,
++                                        90.0f,
++                                        0.0f,
++                                        destination,
++                                        event
++                                    )
++                                );
++                            });
+ 
+                             // the portal obsidian is placed at targetPos.y - 2, so if we want to place the entity
+                             // on the obsidian, we need to spawn at targetPos.y - 1
+@@ -4077,7 +4335,7 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+                     destination.paperConfig().environment.portalSearchRadius;
+                 int portalCreateRadius = destination.paperConfig().environment.portalCreateRadius;
+ 
+-                WorldBorder destinationBorder = destination.getWorldBorder();
++                final AtomicReference<ServerLevel> finalDestination = new AtomicReference<>(destination);
+                 double dimensionScale = DimensionType.getTeleportationScale(origin.dimensionType(), destination.dimensionType());
+                 BlockPos targetPos = destination.getWorldBorder().clampToBounds(this.getX() * dimensionScale, this.getY(), this.getZ() * dimensionScale);
+ 
+@@ -4090,7 +4348,7 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+                         // no portal could be created
+                         if (portal == null) {
+                             portalInfoCompletable.complete(
+-                                new PortalInfo(Vec3.atCenterOf(targetPos), Vec3.ZERO, 90.0f, 0.0f, destination, null)
++                                new PortalInfo(Vec3.atCenterOf(targetPos), Vec3.ZERO, 90.0f, 0.0f, finalDestination.get(), null)
+                             );
+                             return;
+                         }
+@@ -4101,73 +4359,114 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+ 
+                         portalInfoCompletable.complete(
+                             PortalShape.createPortalInfo(
+-                                destination, portal, originalPortalDirection, relativePos,
++                                finalDestination.get(), portal, originalPortalDirection, relativePos,
+                                 Entity.this, Entity.this.getDeltaMovement(), Entity.this.getYRot(), Entity.this.getXRot(), null
+                             )
+                         );
+                     }
+                 );
+ 
+-                // kick off search for existing portal or creation
+-                destination.loadChunksAsync(
+-                    // add 32 so that the final search for a portal frame doesn't load any chunks
+-                    targetPos, portalSearchRadius + 32,
+-                    net.minecraft.world.level.chunk.ChunkStatus.EMPTY,
+-                    ca.spottedleaf.concurrentutil.executor.standard.PrioritisedExecutor.Priority.HIGH,
+-                    (chunks) -> {
+-                        BlockUtil.FoundRectangle portal =
+-                            destination.getPortalForcer().findPortalAround(targetPos, destinationBorder, portalSearchRadius).orElse(null);
+-                        if (portal != null) {
+-                            portalFound.complete(portal);
+-                            return;
+-                        }
++                this.callPortalEventAsync(
++                    this,
++                    origin,
++                    new PositionImpl(
++                        this.getX(), this.getY(), this.getZ()
++                    ),
++                    destination.getLevel(),
++                    new PositionImpl(
++                        targetPos.getX(), targetPos.getY(), targetPos.getZ()
++                    ),
++                    PlayerTeleportEvent.TeleportCause.NETHER_PORTAL,
++                    portalSearchRadius,
++                    portalCreateRadius
++                )
++                .thenAccept(e -> {
++                    if (e.isCancelled()) {
++                        portalFound.complete(null);
++                        return;
++                    }
+ 
+-                        // add tickets so that we can re-search for a portal once the chunks are loaded
+-                        Long ticketId = Long.valueOf(CREATE_PORTAL_DOUBLE_CHECK.getAndIncrement());
+-                        for (net.minecraft.world.level.chunk.ChunkAccess chunk : chunks) {
+-                            destination.chunkSource.addTicketAtLevel(
+-                                TicketType.NETHER_PORTAL_DOUBLE_CHECK, chunk.getPos(),
+-                                io.papermc.paper.chunk.system.scheduling.ChunkHolderManager.MAX_TICKET_LEVEL,
+-                                ticketId
+-                            );
+-                        }
++                    finalDestination.set(((CraftWorld) e.getTo().getWorld()).getHandle());
++                    final ServerLevel destinationFinal = finalDestination.get();
++                    final WorldBorder destinationBorderFinal = destinationFinal.getWorldBorder();
++                    final BlockPos targetPosFinal = new BlockPos(e.getTo().getBlockX(), e.getTo().getBlockY(), e.getTo().getBlockZ());
++                    final int portalSearchRadiusFinal = e.getSearchRadius();
++                    final int portalCreateRadiusFinal = e.getCreationRadius();
++
++                    // kick off search for existing portal or creation
++                    destinationFinal.loadChunksAsync(
++                        // add 32 so that the final search for a portal frame doesn't load any chunks
++                        targetPosFinal, portalSearchRadiusFinal + 32,
++                        net.minecraft.world.level.chunk.ChunkStatus.EMPTY,
++                        ca.spottedleaf.concurrentutil.executor.standard.PrioritisedExecutor.Priority.HIGH,
++                        (chunks) -> {
++                            BlockUtil.FoundRectangle portal =
++                                destinationFinal.getPortalForcer().findPortalAround(targetPosFinal, destinationBorderFinal, portalSearchRadiusFinal).orElse(null);
++                            if (portal != null) {
++                                portalFound.complete(portal);
++                                return;
++                            }
+ 
+-                        // no portal found - create one
+-                        destination.loadChunksAsync(
+-                            targetPos, portalCreateRadius + 32,
+-                            ca.spottedleaf.concurrentutil.executor.standard.PrioritisedExecutor.Priority.HIGH,
+-                            (chunks2) -> {
+-                                // don't need the tickets anymore
+-                                // note: we expect removeTicketsAtLevel to add an unknown ticket for us automatically
+-                                // if the ticket level were to decrease
+-                                for (net.minecraft.world.level.chunk.ChunkAccess chunk : chunks) {
+-                                    destination.chunkSource.removeTicketAtLevel(
+-                                        TicketType.NETHER_PORTAL_DOUBLE_CHECK, chunk.getPos(),
+-                                        io.papermc.paper.chunk.system.scheduling.ChunkHolderManager.MAX_TICKET_LEVEL,
+-                                        ticketId
+-                                    );
+-                                }
++                            // add tickets so that we can re-search for a portal once the chunks are loaded
++                            Long ticketId = Long.valueOf(CREATE_PORTAL_DOUBLE_CHECK.getAndIncrement());
++                            for (net.minecraft.world.level.chunk.ChunkAccess chunk : chunks) {
++                                destinationFinal.chunkSource.addTicketAtLevel(
++                                    TicketType.NETHER_PORTAL_DOUBLE_CHECK, chunk.getPos(),
++                                    io.papermc.paper.chunk.system.scheduling.ChunkHolderManager.MAX_TICKET_LEVEL,
++                                    ticketId
++                                );
++                            }
+ 
+-                                // when two entities portal at the same time, it is possible that both entities reach this
+-                                // part of the code - and create a double portal
+-                                // to fix this, we just issue another search to try and see if another entity created
+-                                // a portal nearby
+-                                BlockUtil.FoundRectangle existingTryAgain =
+-                                    destination.getPortalForcer().findPortalAround(targetPos, destinationBorder, portalSearchRadius).orElse(null);
+-                                if (existingTryAgain != null) {
+-                                    portalFound.complete(existingTryAgain);
+-                                    return;
+-                                }
++                            // no portal found - create one
++                            destinationFinal.loadChunksAsync(
++                                targetPosFinal, portalCreateRadiusFinal + 32,
++                                ca.spottedleaf.concurrentutil.executor.standard.PrioritisedExecutor.Priority.HIGH,
++                                (chunks2) -> {
++                                    // don't need the tickets anymore
++                                    // note: we expect removeTicketsAtLevel to add an unknown ticket for us automatically
++                                    // if the ticket level were to decrease
++                                    for (net.minecraft.world.level.chunk.ChunkAccess chunk : chunks) {
++                                        destinationFinal.chunkSource.removeTicketAtLevel(
++                                            TicketType.NETHER_PORTAL_DOUBLE_CHECK, chunk.getPos(),
++                                            io.papermc.paper.chunk.system.scheduling.ChunkHolderManager.MAX_TICKET_LEVEL,
++                                            ticketId
++                                        );
++                                    }
+ 
+-                                // we do not have the correct entity reference here
+-                                BlockUtil.FoundRectangle createdPortal =
+-                                    destination.getPortalForcer().createPortal(targetPos, originalPortalDirection, null, portalCreateRadius).orElse(null);
+-                                // if it wasn't created, passing null is expected here
+-                                portalFound.complete(createdPortal);
+-                            }
+-                        );
+-                    }
+-                );
++                                    // when two entities portal at the same time, it is possible that both entities reach this
++                                    // part of the code - and create a double portal
++                                    // to fix this, we just issue another search to try and see if another entity created
++                                    // a portal nearby
++                                    BlockUtil.FoundRectangle existingTryAgain = destinationFinal.getPortalForcer().findPortalAround(
++                                            targetPosFinal,
++                                            destinationBorderFinal,
++                                            portalSearchRadiusFinal
++                                        ).orElse(null);
++                                    if (existingTryAgain != null) {
++                                        portalFound.complete(existingTryAgain);
++                                        return;
++                                    }
++
++                                    // if we can't create a portal, we just return null
++                                    if (!e.getCanCreatePortal()) {
++                                        portalFound.complete(null);
++                                        return;
++                                    }
++
++                                    // we do not have the correct entity reference here
++                                    BlockUtil.FoundRectangle createdPortal = destinationFinal.getPortalForcer().createPortal(
++                                            targetPosFinal,
++                                            originalPortalDirection,
++                                            null,
++                                            portalCreateRadiusFinal
++                                        ).orElse(null);
++                                    // if it wasn't created, passing null is expected here
++                                    portalFound.complete(createdPortal);
++                                }
++                            );
++                        }
++                    );
++                });
+                 break;
+             }
+             default: {
+@@ -4209,7 +4508,7 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+ 
+     }
+ 
+-    protected boolean portalToAsync(ServerLevel destination, boolean takePassengers,
++    protected boolean portalToAsync(ServerLevel originalDestination, boolean takePassengers,
+                                     PortalType type, java.util.function.Consumer<Entity> teleportComplete) {
+         io.papermc.paper.util.TickThread.ensureTickThread(this, "Cannot portal entity async");
+         if (!this.canPortalAsync(takePassengers)) {
+@@ -4223,65 +4522,152 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+         );
+ 
+         // first, remove entity/passengers from world
+-        EntityTreeNode passengerTree = this.detachPassengers();
+-        List<EntityTreeNode> fullPassengerTree = passengerTree.getFullTree();
+         ServerLevel originWorld = (ServerLevel)this.level;
+ 
+-        for (EntityTreeNode node : fullPassengerTree) {
+-            node.root.preChangeDimension();
+-            node.root.prePortalLogic(originWorld, destination, type);
+-        }
+-
+-        for (EntityTreeNode node : fullPassengerTree) {
+-            // we will update pos/rot/speed later
+-            node.root = node.root.transformForAsyncTeleport(destination, null, null, null, null);
+-            // set portal cooldown
+-            node.root.setPortalCooldown();
+-        }
++        final Stack<EntityTreeNode> passengerStack = new Stack<>();
++        passengerStack.add(this.detachPassengers());
+ 
+-        // ensure the region is always ticking in case of a shutdown
+-        // otherwise, the shutdown will not be able to complete the shutdown as it requires a ticking region
+-        Long teleportHoldId = Long.valueOf(TELEPORT_HOLD_TICKET_GEN.getAndIncrement());
+-        originWorld.chunkSource.addTicketAtLevel(
+-            TicketType.TELEPORT_HOLD_TICKET, initialPositionChunk,
+-            io.papermc.paper.chunk.system.scheduling.ChunkHolderManager.MAX_TICKET_LEVEL,
+-            teleportHoldId
++        final Location from = new Location(
++            originWorld.getWorld(),
++            initialPosition.x,
++            initialPosition.y,
++            initialPosition.z
+         );
+ 
+-        ServerLevel.PendingTeleport beforeFindDestination = new ServerLevel.PendingTeleport(passengerTree, initialPosition);
+-        originWorld.pushPendingTeleport(beforeFindDestination);
++        // TODO: Figure out how to allow for world changes besides cancellation
++        queuePrePortalEntities(passengerStack, null, from, originalDestination.getWorld())
++            .thenAccept(event -> {
++                final ServerLevel destination = (ServerLevel) ((CraftWorld) event.getTargetWorld()).getHandle();
++                final EntityTreeNode passengerTree = this.detachPassengers();
++                final List<EntityTreeNode> fullPassengerTree = passengerTree.getFullTree();
+ 
+-        ca.spottedleaf.concurrentutil.completable.Completable<PortalInfo> portalInfoCompletable
+-            = new ca.spottedleaf.concurrentutil.completable.Completable<>();
+ 
+-        portalInfoCompletable.addWaiter((PortalInfo info, Throwable throwable) -> {
+-            if (!originWorld.removePendingTeleport(beforeFindDestination)) {
+-                // the shutdown thread has placed us back into the origin world at the original position
+-                // we just have to abandon this teleport to prevent duplication
+-                return;
+-            }
+-            originWorld.chunkSource.removeTicketAtLevel(
+-                TicketType.TELEPORT_HOLD_TICKET, initialPositionChunk,
+-                io.papermc.paper.chunk.system.scheduling.ChunkHolderManager.MAX_TICKET_LEVEL,
+-                teleportHoldId
+-            );
+-            // adjust passenger tree to final pos
+-            for (EntityTreeNode node : fullPassengerTree) {
+-                node.root.transform(info.pos, Float.valueOf(info.yRot), Float.valueOf(info.xRot), info.speed);
++                for (EntityTreeNode node : fullPassengerTree) {
++                    node.root.preChangeDimension();
++                    node.root.prePortalLogic(originWorld, destination, type);
++                }
++
++                for (EntityTreeNode node : fullPassengerTree) {
++                    // we will update pos/rot/speed later
++                    node.root = node.root.transformForAsyncTeleport(destination, null, null, null, null);
++                    // set portal cooldown
++                    node.root.setPortalCooldown();
++                }
++
++                // ensure the region is always ticking in case of a shutdown
++                // otherwise, the shutdown will not be able to complete the shutdown as it requires a ticking region
++                Long teleportHoldId = Long.valueOf(TELEPORT_HOLD_TICKET_GEN.getAndIncrement());
++                originWorld.chunkSource.addTicketAtLevel(
++                    TicketType.TELEPORT_HOLD_TICKET, initialPositionChunk,
++                    io.papermc.paper.chunk.system.scheduling.ChunkHolderManager.MAX_TICKET_LEVEL,
++                    teleportHoldId
++                );
++
++                ServerLevel.PendingTeleport beforeFindDestination = new ServerLevel.PendingTeleport(passengerTree, initialPosition);
++                originWorld.pushPendingTeleport(beforeFindDestination);
++
++                ca.spottedleaf.concurrentutil.completable.Completable<PortalInfo> portalInfoCompletable
++                    = new ca.spottedleaf.concurrentutil.completable.Completable<>();
++
++                portalInfoCompletable.addWaiter((PortalInfo info, Throwable throwable) -> {
++                    if (!originWorld.removePendingTeleport(beforeFindDestination)) {
++                        // the shutdown thread has placed us back into the origin world at the original position
++                        // we just have to abandon this teleport to prevent duplication
++                        return;
++                    }
++                    originWorld.chunkSource.removeTicketAtLevel(
++                        TicketType.TELEPORT_HOLD_TICKET, initialPositionChunk,
++                        io.papermc.paper.chunk.system.scheduling.ChunkHolderManager.MAX_TICKET_LEVEL,
++                        teleportHoldId
++                    );
++
++                    // adjust passenger tree to final pos
++                    final Stack<EntityTreeNode> stack = new Stack<>();
++                    stack.addAll(fullPassengerTree);
++                    queuePortalEntities(stack, info).thenRun(() -> {
++                        // place
++                        passengerTree.root.placeInAsync(
++                            originWorld, destination, Entity.TELEPORT_FLAG_LOAD_CHUNK | (takePassengers ? Entity.TELEPORT_FLAG_TELEPORT_PASSENGERS : 0L),
++                            passengerTree, teleportComplete
++                        );
++                    });
++                });
++
++                passengerTree.root.findOrCreatePortalAsync(originWorld, destination, type, portalInfoCompletable);
++            });
++
++        return true;
++    }
++
++    private CompletableFuture<EntityPortalReadyEvent> queuePrePortalEntities(
++        final Stack<EntityTreeNode> stack,
++        final EntityPortalReadyEvent lastEvent,
++        final Location from,
++        final @Nullable World targetWorld) {
++        if (stack.isEmpty()) {
++            return CompletableFuture.completedFuture(lastEvent);
++        }
++
++        final EntityTreeNode node = stack.pop();
++        final org.bukkit.entity.Entity bukkitEntity = node.root.getBukkitEntity();
++        // Only nether portals are supported??
++        return new EntityPortalReadyEvent(
++            bukkitEntity,
++            targetWorld,
++            org.bukkit.PortalType.NETHER
++        ).callEventAsync(from).thenApply(e -> (EntityPortalReadyEvent) e).thenCompose((event) -> {
++            if (!event.isCancelled() && event.getTargetWorld() != null) {
++                if (node.passengers != null)
++                    stack.addAll(Arrays.asList(node.passengers));
++            } else {
++                node.root.stopRiding();
+             }
+ 
+-            // place
+-            passengerTree.root.placeInAsync(
+-                originWorld, destination, Entity.TELEPORT_FLAG_LOAD_CHUNK | (takePassengers ? Entity.TELEPORT_FLAG_TELEPORT_PASSENGERS : 0L),
+-                passengerTree, teleportComplete
+-            );
++            return queuePrePortalEntities(stack, event, from, targetWorld);
+         });
++    }
+ 
++    private CompletableFuture<Void> queuePortalEntities(final Stack<EntityTreeNode> stack, final PortalInfo info) {
++        if (stack.isEmpty()) {
++            return CompletableFuture.completedFuture(null);
++        }
++
++        final EntityTreeNode node = stack.pop();
++        final org.bukkit.entity.Entity bukkitEntity = node.root.getBukkitEntity();
++
++        final EntityPortalExitEvent event = new EntityPortalExitEvent(
++            bukkitEntity,
++            bukkitEntity.getLocation(),
++            new Location(
++                info.world.getWorld(),
++                info.pos.x,
++                info.pos.y,
++                info.pos.z,
++                info.yRot, // yaw
++                info.xRot // pitch
++            ),
++            bukkitEntity.getVelocity(),
++            org.bukkit.craftbukkit.util.CraftVector.toBukkit(info.speed)
++        );
+ 
+-        passengerTree.root.findOrCreatePortalAsync(originWorld, destination, type, portalInfoCompletable);
++        return event.callEventAsync(bukkitEntity.getLocation())
++            .thenRun(() -> {
++                Vec3 position = info.pos;
++                float yaw = info.yRot;
++                float pitch = info.xRot;
++                Vec3 velocity = info.speed;
+ 
+-        return true;
++                if (event.getTo() != null && this.isAlive()) {
++                    position = new Vec3(event.getTo().getX(), event.getTo().getY(), event.getTo().getZ());
++                    yaw = event.getTo().getYaw();
++                    pitch = event.getTo().getPitch();
++                    velocity = org.bukkit.craftbukkit.util.CraftVector.toNMS(event.getAfter());
++                }
++
++                node.root.transform(position, yaw, pitch, velocity);
++            });
+     }
++
+     // Folia end - region threading
+ 
+     @Nullable
+@@ -4492,6 +4878,33 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource {
+         return new CraftPortalEvent(event);
+     }
+ 
++    protected CompletableFuture<CraftPortalEvent> callPortalEventAsync(Entity entity,
++                                                                       ServerLevel enterWorldServer, PositionImpl originPosition,
++                                                                       ServerLevel exitWorldServer, PositionImpl exitPosition,
++                                                                       PlayerTeleportEvent.TeleportCause cause,
++                                                                       int searchRadius, int creationRadius) {
++        org.bukkit.entity.Entity bukkitEntity = entity.getBukkitEntity();
++        Location enter = CraftLocation.toBukkit(originPosition, enterWorldServer.getWorld());
++        Location exit = CraftLocation.toBukkit(exitPosition, exitWorldServer.getWorld());
++
++        // Paper start
++        final org.bukkit.PortalType portalType = switch (cause) {
++            case END_PORTAL -> org.bukkit.PortalType.ENDER;
++            case NETHER_PORTAL -> org.bukkit.PortalType.NETHER;
++            default -> org.bukkit.PortalType.CUSTOM;
++        };
++
++        EntityPortalEvent event = new EntityPortalEvent(bukkitEntity, enter, exit, searchRadius, portalType);
++        // Paper end
++        return event.callEventAsync(enter)
++            .thenApply((ignore) -> {
++                if (event.isCancelled() || event.getTo() == null || event.getTo().getWorld() == null || !entity.isAlive()) {
++                    return null;
++                }
++                return new CraftPortalEvent(event);
++            });
++    }
++
+     protected Optional<BlockUtil.FoundRectangle> getExitPortal(ServerLevel worldserver, BlockPos blockposition, boolean flag, WorldBorder worldborder, int searchRadius, boolean canCreatePortal, int createRadius) {
+         return worldserver.getPortalForcer().findPortalAround(blockposition, worldborder, searchRadius);
+         // CraftBukkit end
+diff --git a/src/main/java/net/minecraft/world/level/block/NetherPortalBlock.java b/src/main/java/net/minecraft/world/level/block/NetherPortalBlock.java
+index a6ab0d0defc05e56a91084c49897059670a1324b..642729cd700cccffbaa47cc7c71fc44920e4eb15 100644
+--- a/src/main/java/net/minecraft/world/level/block/NetherPortalBlock.java
++++ b/src/main/java/net/minecraft/world/level/block/NetherPortalBlock.java
+@@ -84,10 +84,12 @@ public class NetherPortalBlock extends Block {
+     public void entityInside(BlockState state, Level world, BlockPos pos, Entity entity) {
+         if (!new io.papermc.paper.event.entity.EntityInsideBlockEvent(entity.getBukkitEntity(), org.bukkit.craftbukkit.block.CraftBlock.at(world, pos)).callEvent()) { return; } // Paper
+         if (entity.canChangeDimensions()) {
++            // Folia start - event handling
+             // CraftBukkit start - Entity in portal
+-            EntityPortalEnterEvent event = new EntityPortalEnterEvent(entity.getBukkitEntity(), new org.bukkit.Location(world.getWorld(), pos.getX(), pos.getY(), pos.getZ()));
+-            world.getCraftServer().getPluginManager().callEvent(event);
++            //EntityPortalEnterEvent event = new EntityPortalEnterEvent(entity.getBukkitEntity(), new org.bukkit.Location(world.getWorld(), pos.getX(), pos.getY(), pos.getZ()));
++            //world.getCraftServer().getPluginManager().callEventAsync(event);
+             // CraftBukkit end
++            // Folia end - event handling
+             entity.handleInsidePortal(pos);
+         }
+ 
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftWorld.java b/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
+index 723ae4b75c84fe952377c02d42cf7a710f7047ea..53036885edbd37f6eeac633b3f9f11728e54066a 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
+@@ -5,7 +5,7 @@ import com.google.common.base.Predicates;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableMap;
+ import com.mojang.datafixers.util.Pair;
+-import it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap;
++import io.papermc.paper.threadedregions.TickRegionScheduler;
+ import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
+ import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
+ import java.io.File;
+@@ -20,7 +20,6 @@ import java.util.Objects;
+ import java.util.Random;
+ import java.util.Set;
+ import java.util.UUID;
+-import java.util.concurrent.ExecutionException;
+ import java.util.function.Predicate;
+ import java.util.stream.Collectors;
+ import net.minecraft.core.BlockPos;
+@@ -51,7 +50,6 @@ import net.minecraft.world.entity.LightningBolt;
+ import net.minecraft.world.entity.item.FallingBlockEntity;
+ import net.minecraft.world.entity.item.ItemEntity;
+ import net.minecraft.world.entity.raid.Raids;
+-import net.minecraft.world.flag.FeatureFlags;
+ import net.minecraft.world.level.ChunkPos;
+ import net.minecraft.world.level.ClipContext;
+ import net.minecraft.world.level.GameRules;
+@@ -96,7 +94,6 @@ import org.bukkit.craftbukkit.inventory.CraftItemStack;
+ import org.bukkit.craftbukkit.metadata.BlockMetadataStore;
+ import org.bukkit.craftbukkit.persistence.CraftPersistentDataContainer;
+ import org.bukkit.craftbukkit.persistence.CraftPersistentDataTypeRegistry;
+-import org.bukkit.craftbukkit.potion.CraftPotionUtil;
+ import org.bukkit.craftbukkit.util.CraftLocation;
+ import org.bukkit.craftbukkit.util.CraftMagicNumbers;
+ import org.bukkit.craftbukkit.util.CraftNamespacedKey;
+@@ -116,7 +113,6 @@ import org.bukkit.entity.TippedArrow;
+ import org.bukkit.entity.Trident;
+ import org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason;
+ import org.bukkit.event.weather.LightningStrikeEvent;
+-import org.bukkit.event.world.SpawnChangeEvent;
+ import org.bukkit.event.world.TimeSkipEvent;
+ import org.bukkit.generator.BiomeProvider;
+ import org.bukkit.generator.BlockPopulator;
+@@ -2443,7 +2439,7 @@ public class CraftWorld extends CraftRegionAccessor implements World {
+         if (io.papermc.paper.util.TickThread.isTickThreadFor(this.getHandle(), x, z)) { // Folia - region threading
+             net.minecraft.world.level.chunk.LevelChunk immediate = this.world.getChunkSource().getChunkAtIfLoadedImmediately(x, z);
+             if (immediate != null) {
+-                return java.util.concurrent.CompletableFuture.completedFuture(new CraftChunk(immediate));
++                return TickRegionScheduler.addEventListen(java.util.concurrent.CompletableFuture.completedFuture(new CraftChunk(immediate)));
+             }
+         }
+ 
+@@ -2464,7 +2460,7 @@ public class CraftWorld extends CraftRegionAccessor implements World {
+             });
+         });
+ 
+-        return ret;
++        return TickRegionScheduler.addEventListen(ret);  // Folia start - event handler
+     }
+ 
+     // Paper start - implement pointers
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+index 19b47478d318edce1242c2a5ddd73da963a24595..381aca35372b7e38af58220172036c9d5a64e348 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+@@ -7,6 +7,8 @@ import com.google.common.collect.Lists;
+ import java.util.List;
+ import java.util.Set;
+ import java.util.UUID;
++
++import io.papermc.paper.threadedregions.TickRegionScheduler;
+ import net.minecraft.nbt.CompoundTag;
+ import net.minecraft.nbt.Tag;
+ import net.minecraft.network.chat.Component;
+@@ -1357,7 +1359,7 @@ public abstract class CraftEntity implements org.bukkit.entity.Entity {
+             ret.complete(Boolean.FALSE);
+         }
+ 
+-        return ret;
++        return TickRegionScheduler.addEventListen(ret);
+         // Folia end - region threading
+     }
+ 
